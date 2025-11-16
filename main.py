@@ -2,11 +2,13 @@ from fastapi import FastAPI, HTTPException
 import asyncpg
 import os
 import asyncio
-from playwright.async_api import async_playwright
+import requests
+from bs4 import BeautifulSoup
 import json
 import random
 from datetime import datetime
 import pandas as pd
+import re
 
 app = FastAPI(title="HH Analytics API @GuglPriv98786")
 
@@ -40,76 +42,71 @@ async def get_analytics(query: str):
             result["cached"] = True
             return result
 
-        data = await parse_hh(query)
+        data = await parse_hh_requests(query)
         
-        # Аналитика Pandas
+        # Аналитика
         df = pd.DataFrame(data['vacancies'])
-        avg_salary = df['salary_parsed'].mean() if not df.empty and 'salary_parsed' in df.columns else 0
-        geo_count = df['geo'].value_counts().to_dict() if 'geo' in df.columns else {}
+        salaries = [s for s in df['salary_parsed'] if s > 0]
+        avg_salary = sum(salaries) / len(salaries) if salaries else 0
         
         result = {
             "query": query,
             "count": data['count'],
-            "avg_salary": f"{int(avg_salary):, } ₽" if avg_salary else "N/A",
-            "geo_distribution": geo_count,
+            "avg_salary": f"{int(avg_salary):,} ₽" if avg_salary else "N/A",
             "sample": data['vacancies'][:5],
-            "source": "hh.ru",
-            "updated": datetime.now().isoformat()
+            "source": "hh.ru (requests+BS4)",
+            "updated": datetime.now().isoformat(),
+            "cached": False
         }
         
         await conn.execute(
-            "INSERT INTO analytics (query, result) VALUES ($1, $2) ON CONFLICT (query) DO UPDATE SET result = $2, created_at = NOW()",
+            "INSERT INTO analytics (query, result) VALUES ($1, $2) ON CONFLICT (query) DO UPDATE SET result = $2",
             query.lower(), json.dumps(result)
         )
-        result["cached"] = False
         return result
 
-async def parse_hh(query: str):
+async def parse_hh_requests(query: str):
+    headers = {
+        "User-Agent": "hh-analytics-bot/1.0 (+hi@yourapp.com)",
+        "Accept-Language": "ru-RU,ru;q=0.9"
+    }
     vacancies = []
     count = 0
     
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.set_extra_http_headers({
-            "User-Agent": "hh-analytics-bot/1.0 (+hi@yourapp.com)"
-        })
-        
-        for page_num in range(0, 2):  # 2 страницы
-            await asyncio.sleep(1.1 + random.uniform(0, 0.5))
-            await page.goto(f"https://hh.ru/search/vacancy?text={query}&area=1&page={page_num}", wait_until="networkidle")
+    for page in range(2):
+        await asyncio.sleep(1.1 + random.uniform(0, 0.5))
+        url = f"https://hh.ru/search/vacancy?text={query}&area=1&page={page}"
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code != 200:
+                break
+            soup = BeautifulSoup(response.text, 'lxml')
+            cards = soup.find_all('div', class_='vacancy-serp-item__layout')
             
-            cards = await page.query_selector_all('.vacancy-serp-item')
             for card in cards:
-                title_elem = await card.query_selector('a[data-qa="vacancy-serp__vacancy-title"]')
-                salary_elem = await card.query_selector('[data-qa="vacancy-serp__vacancy-compensation"]')
-                company_elem = await card.query_selector('[data-qa="vacancy-serp__vacancy-employer"]')
+                title_tag = card.find('a', {'data-qa': 'vacancy-serp__vacancy-title'})
+                salary_tag = card.find('span', {'data-qa': 'vacancy-serp__vacancy-compensation'})
                 
-                title = await title_elem.inner_text() if title_elem else "N/A"
-                salary_text = await salary_elem.inner_text() if salary_elem else "N/A"
-                company = await company_elem.inner_text() if company_elem else "N/A"
-                
-                # Парсинг зарплаты (пример)
+                title = title_tag.get_text(strip=True) if title_tag else "N/A"
+                salary_text = salary_tag.get_text(strip=True) if salary_tag else "N/A"
                 salary_parsed = parse_salary(salary_text)
                 
-                # Время жизни (пример, из date)
-                life_time = random.randint(7, 30)  # Заглушка, парси реальную date
-                
                 vacancies.append({
-                    "title": title.strip(),
-                    "salary": salary_text.strip(),
-                    "salary_parsed": salary_parsed,
-                    "company": company.strip(),
-                    "geo": "Москва",  # Из URL area=1
-                    "life_time_days": life_time
+                    "title": title,
+                    "salary": salary_text,
+                    "salary_parsed": salary_parsed
                 })
                 count += 1
-        
-        await browser.close()
+        except:
+            break
     
     return {"count": count, "vacancies": vacancies}
 
 def parse_salary(text: str) -> float:
-    import re
-    match = re.search(r'от\s*(\d+(?:\.\d+)?)', text.replace(' ', ''))
-    return float(match.group(1)) * 1000 if match else 0
+    if not text or text == "N/A":
+        return 0
+    match = re.search(r'(\d+[\d\s]*)', text.replace(' ', ''))
+    if not match:
+        return 0
+    num = int(''.join(filter(str.isdigit, match.group(1))))
+    return num * 1000 if 'тыс' in text.lower() else num
