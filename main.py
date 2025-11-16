@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException
-import asyncpg
 import os
 import asyncio
 from playwright.async_api import async_playwright
 import json
 import random
 from datetime import datetime
+import asyncpg  # Удалим, используем psycopg3
+from psycopg_pool import AsyncConnectionPool
+from psycopg import AsyncConnection
 
 app = FastAPI(title="HH Analytics API @GuglPriv98786")
 
@@ -15,15 +17,16 @@ pool = None
 @app.on_event("startup")
 async def startup():
     global pool
-    pool = await asyncpg.create_pool(POSTGRES_URL)
-    await pool.execute("""
-        CREATE TABLE IF NOT EXISTS analytics (
-            id SERIAL PRIMARY KEY,
-            query TEXT UNIQUE,
-            result JSONB,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
+    pool = AsyncConnectionPool(POSTGRES_URL, min_size=1, max_size=10)
+    async with pool.connection() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS analytics (
+                id SERIAL PRIMARY KEY,
+                query TEXT UNIQUE,
+                result JSONB,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
 @app.get("/")
 async def root():
@@ -31,27 +34,23 @@ async def root():
 
 @app.get("/analytics/{query}")
 async def get_analytics(query: str):
-    try:
-        # Попробуем из БД
-        row = await pool.fetchrow("SELECT result FROM analytics WHERE query = $1", query.lower())
+    async with pool.connection() as conn:
+        row = await conn.fetchrow("SELECT result FROM analytics WHERE query = $1", query.lower())
         if row:
             result = json.loads(row["result"])
             result["cached"] = True
             return result
 
-        # Парсим hh.ru
         data = await parse_hh(query)
-        await pool.execute(
+        await conn.execute(
             "INSERT INTO analytics (query, result) VALUES ($1, $2) ON CONFLICT (query) DO UPDATE SET result = $2, created_at = NOW()",
             query.lower(), json.dumps(data)
         )
         data["cached"] = False
         return data
-    except Exception as e:
-        raise HTTPException(500, f"Ошибка: {str(e)}")
 
 async def parse_hh(query: str):
-    await asyncio.sleep(1.1 + random.uniform(0, 0.5))  # <1 req/sec
+    await asyncio.sleep(1.1 + random.uniform(0, 0.5))  # Rate limit <1 req/sec
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
