@@ -11,7 +11,7 @@ app = FastAPI(title="HH Analytics API @GuglPriv98786")
 
 SCRAPINGANT_KEY = os.getenv("SCRAPINGANT_KEY")
 
-cache = {}  # простой кэш в памяти
+cache = {}
 
 @app.get("/")
 async def root():
@@ -29,47 +29,49 @@ async def analytics(query: str):
     params = {
         "url": f"https://hh.ru/search/vacancy?text={query}&area=1",
         "x-api-key": SCRAPINGANT_KEY,
-        "browser": "true"   # обязательно — рендерит JS и Cloudflare
+        "browser": "true",
+        "return_text": "true"
     }
 
-    try:
-        r = requests.get(api_url, params=params, timeout=40)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, 'lxml')
+    r = requests.get(api_url, params=params, timeout=40)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, 'lxml')
 
-        cards = soup.find_all('div', {'data-qa': 'vacancy-serp__vacancy'})
-        vacancies = []
+    # Новые универсальные селекторы (работают на ноябрь 2025)
+    cards = soup.find_all('div', class_=re.compile(r'vacancy-search-item|vacancy-serp-item|serp-item'))
 
-        for card in cards:
-            title_tag = card.find('a', {'data-qa': 'vacancy-serp__vacancy-title'})
-            salary_tag = card.find('span', {'data-qa': 'vacancy-serp__vacancy-compensation'})
-            title = title_tag.get_text(strip=True) if title_tag else "Без названия"
-            salary = salary_tag.get_text(strip=True) if salary_tag else "Не указана"
-            salary_num = parse_salary(salary)
-            vacancies.append({"title": title, "salary": salary, "salary_parsed": salary_num})
+    vacancies = []
+    for card in cards:
+        # Заголовок — ищем любую ссылку с классом, содержащим link или title
+        title_tag = card.find('a', class_=re.compile(r'link|title|vacancy', re.I))
+        salary_tag = card.find('span', class_=re.compile(r'compensation|salary', re.I)) or \
+                     card.find('div', class_=re.compile(r'compensation|salary', re.I))
 
-        avg = pd.DataFrame(vacancies)['salary_parsed'].mean()
-        avg_str = f"{int(avg):,} ₽" if avg > 0 else "Не указано"
+        title = title_tag.get_text(strip=True) if title_tag else "Без названия"
+        salary = salary_tag.get_text(strip=True).replace('\u202f', ' ') if salary_tag else "Не указана"
+        salary_num = parse_salary(salary)
 
-        result = {
-            "query": query,
-            "count": len(vacancies),
-            "avg_salary": avg_str,
-            "sample": vacancies[:5],
-            "source": "hh.ru (ScrapingAnt)",
-            "updated": datetime.now().isoformat(),
-            "cached": False
-        }
-        cache[q] = result
-        return result
+        vacancies.append({"title": title, "salary": salary, "salary_parsed": salary_num})
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Парсинг не удался: {str(e)}")
+    avg = pd.DataFrame(vacancies)['salary_parsed'].mean()
+    avg_str = f"{int(avg):,} ₽" if avg > 0 else "Не указано"
+
+    result = {
+        "query": query,
+        "count": len(vacancies),
+        "avg_salary": avg_str,
+        "sample": vacancies[:5],
+        "source": "hh.ru (ScrapingAnt + universal selectors)",
+        "updated": datetime.now().isoformat(),
+        "cached": False
+    }
+    cache[q] = result
+    return result
 
 def parse_salary(text: str) -> float:
     if not text or "по договорённости" in text.lower():
         return 0
-    text = text.replace(' ', '').replace(' ', '')
+    text = text.replace('\u202f', '').replace(' ', '')
     match = re.search(r'(\d+)', text)
     if not match:
         return 0
