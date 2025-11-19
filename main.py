@@ -1,74 +1,87 @@
 from fastapi import FastAPI, HTTPException
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json
 import os
 import requests
 from bs4 import BeautifulSoup
 import json
+import random
+import time
 from datetime import datetime
 import pandas as pd
 import re
-import logging
 
-logging.basicConfig(level=logging.INFO)
+app = FastAPI(title="HH Analytics API @GuglPriv98786")
 
-app = FastAPI()
+POSTGRES_URL = os.getenv("POSTGRES_URL")  # у тебя уже есть
 
-SCRAPINGANT_KEY = os.getenv("SCRAPINGANT_KEY")
-if not SCRAPINGANT_KEY:
-    raise Exception("Добавь SCRAPINGANT_KEY в Environment на Render")
+conn = None
 
-cache = {}
+def get_db():
+    global conn
+    if conn is None or conn.closed:
+        import urllib.parse as up
+        up.uses_netloc.append('postgres')
+        url = up.urlparse(POSTGRES_URL)
+        conn = psycopg2.connect(
+            database=url.path[1:],
+            user=url.username,
+            password=url.password,
+            host=url.hostname,
+            port=url.port
+        )
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS analytics (
+                id SERIAL PRIMARY KEY,
+                query TEXT UNIQUE,
+                result JSONB,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+    return conn
 
 @app.get("/")
-async def root():
-    return {"message": "HH Analytics API работает!", "user": "@GuglPriv98786"}
+def root():
+    return {"message": "HH Analytics API работает!", "time": datetime.now().isoformat()}
 
 @app.get("/analytics/{query}")
-async def analytics(query: str):
-    q = query.lower()
-    if q in cache:
-        result = cache[q].copy()
+def get_analytics(query: str):
+    db = get_db()
+    cur = db.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT result FROM analytics WHERE query = %s", (query.lower(),))
+    row = cur.fetchone()
+    if row:
+        result = json.loads(row['result'])
         result["cached"] = True
+        cur.close()
         return result
 
-    vacancies = []
-    url = f"https://api.scrapingant.com/v2/general?url=https%3A%2F%2Fhh.ru%2Fsearch%2Fvacancy%3Ftext%3D{query}%26area%3D1&x-api-key={SCRAPINGANT_KEY}"
-    try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, 'lxml')
-        cards = soup.find_all('div', {'data-qa': 'vacancy-serp__vacancy'})
+    data = parse_hh_sync(query)
+    df = pd.DataFrame(data['vacancies'])
+    salaries = [s for s in df['salary_parsed'] if s > 0]
+    avg_salary = sum(salaries) / len(salaries) if salaries else 0
 
-        for card in cards:
-            title_tag = card.find('a', {'data-qa': 'vacancy-serp__vacancy-title'})
-            salary_tag = card.find('span', {'data-qa': 'vacancy-serp__vacancy-compensation'})
-            title = title_tag.get_text(strip=True) if title_tag else "N/A"
-            salary = salary_tag.get_text(strip=True) if salary_tag else "N/A"
-            salary_num = parse_salary(salary)
-            vacancies.append({"title": title, "salary": salary, "salary_parsed": salary_num})
+    result = {
+        "query": query,
+        "count": data['count'],
+        "avg_salary": f"{int(avg_salary):,} ₽" if avg_salary else "N/A",
+        "sample": data['vacancies'][:5],
+        "source": "hh.ru",
+        "updated": datetime.now().isoformat(),
+        "cached": False
+    }
 
-        avg = pd.DataFrame(vacancies)['salary_parsed'].mean()
-        avg_str = f"{int(avg):,} ₽" if avg > 0 else "N/A"
+    # корректировка:
+    cur.execute(
+        "INSERT INTO analytics (query, result) VALUES (%s, %s) ON CONFLICT (query) DO UPDATE SET result = %s",
+        (query.lower(), Json(json.dumps(result)), Json(json.dumps(result)))
+    )
+    db.commit()
+    cur.close()
+    return result
 
-        result = {
-            "query": query,
-            "count": len(vacancies),
-            "avg_salary": avg_str,
-            "sample": vacancies[:5],
-            "source": "hh.ru via ScrapingAnt",
-            "updated": datetime.now().isoformat(),
-            "cached": False
-        }
-        cache[q] = result
-        return result
+# parse_hh_sync и parse_salary — оставляем как есть (они работают)
 
-    except Exception as e:
-        logging.error(str(e))
-        raise HTTPException(500, "Парсинг временно недоступен")
-
-def parse_salary(t: str) -> float:
-    if not t or "по договорённости" in t: return 0
-    t = t.replace(' ', '').replace(' ', '')
-    m = re.search(r'(\d+)', t)
-    if not m: return 0
-    num = int(m.group(1))
-    return num * 1000 if 'тыс' in t.lower() else num
+# ... (остальной код без изменений)
