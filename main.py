@@ -1,15 +1,11 @@
 from fastapi import FastAPI, HTTPException
 import os
 import requests
-from bs4 import BeautifulSoup
 import json
 from datetime import datetime
 import pandas as pd
-import re
 
 app = FastAPI(title="HH Analytics API @GuglPriv98786")
-
-SCRAPINGANT_KEY = os.getenv("SCRAPINGANT_KEY")
 
 cache = {}
 
@@ -25,55 +21,52 @@ async def analytics(query: str):
         result["cached"] = True
         return result
 
-    api_url = "https://api.scrapingant.com/v2/general"
+    api_url = "https://api.hh.ru/vacancies"
     params = {
-        "url": f"https://hh.ru/search/vacancy?text={query}&area=1",
-        "x-api-key": SCRAPINGANT_KEY,
-        "browser": "true",
-        "return_text": "true"
+        "text": query,
+        "area": 1,  # Москва
+        "per_page": 50,  # до 50 вакансий
+        "page": 0
     }
+    headers = {"User-Agent": "HH-Analytics-Bot/1.0 (+hi@yourapp.com)"}
 
-    r = requests.get(api_url, params=params, timeout=40)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, 'lxml')
+    try:
+        r = requests.get(api_url, params=params, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
 
-    # Новые универсальные селекторы (работают на ноябрь 2025)
-    cards = soup.find_all('div', class_=re.compile(r'vacancy-search-item|vacancy-serp-item|serp-item'))
+        vacancies = []
+        for item in data.get("items", []):
+            name = item.get("name", "Без названия")
+            salary = item.get("salary")
+            if salary:
+                from_sal = salary.get("from")
+                to_sal = salary.get("to")
+                currency = salary.get("currency", "RUR")
+                sal_text = f"от {from_sal}" if from_sal and not to_sal else f"{from_sal}–{to_sal}" if from_sal and to_sal else f"до {to_sal}"
+                sal_text += f" {currency}"
+                sal_parsed = (from_sal or to_sal or 0)
+            else:
+                sal_text = "Не указана"
+                sal_parsed = 0
 
-    vacancies = []
-    for card in cards:
-        # Заголовок — ищем любую ссылку с классом, содержащим link или title
-        title_tag = card.find('a', class_=re.compile(r'link|title|vacancy', re.I))
-        salary_tag = card.find('span', class_=re.compile(r'compensation|salary', re.I)) or \
-                     card.find('div', class_=re.compile(r'compensation|salary', re.I))
+            vacancies.append({"title": name, "salary": sal_text, "salary_parsed": sal_parsed})
 
-        title = title_tag.get_text(strip=True) if title_tag else "Без названия"
-        salary = salary_tag.get_text(strip=True).replace('\u202f', ' ') if salary_tag else "Не указана"
-        salary_num = parse_salary(salary)
+        df = pd.DataFrame(vacancies)
+        avg = df['salary_parsed'].mean()
+        avg_str = f"{int(avg):,} ₽" if avg > 0 else "Не указано"
 
-        vacancies.append({"title": title, "salary": salary, "salary_parsed": salary_num})
+        result = {
+            "query": query,
+            "count": len(vacancies),
+            "avg_salary": avg_str,
+            "sample": vacancies[:5],
+            "source": "hh.ru (official API)",
+            "updated": datetime.now().isoformat(),
+            "cached": False
+        }
+        cache[q] = result
+        return result
 
-    avg = pd.DataFrame(vacancies)['salary_parsed'].mean()
-    avg_str = f"{int(avg):,} ₽" if avg > 0 else "Не указано"
-
-    result = {
-        "query": query,
-        "count": len(vacancies),
-        "avg_salary": avg_str,
-        "sample": vacancies[:5],
-        "source": "hh.ru (ScrapingAnt + universal selectors)",
-        "updated": datetime.now().isoformat(),
-        "cached": False
-    }
-    cache[q] = result
-    return result
-
-def parse_salary(text: str) -> float:
-    if not text or "по договорённости" in text.lower():
-        return 0
-    text = text.replace('\u202f', '').replace(' ', '')
-    match = re.search(r'(\d+)', text)
-    if not match:
-        return 0
-    num = int(match.group(1))
-    return num * 1000 if 'тыс' in text.lower() else num
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка API: {str(e)}")
